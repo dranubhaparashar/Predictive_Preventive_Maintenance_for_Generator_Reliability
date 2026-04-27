@@ -812,8 +812,4 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Recommended leadership message
-This solution now demonstrates a full analytics maturity path:
-**Descriptive -> Predictive -> Prescriptive**.
-
 
