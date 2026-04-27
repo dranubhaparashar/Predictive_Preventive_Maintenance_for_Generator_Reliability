@@ -10,6 +10,14 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -179,6 +187,188 @@ def summarize_algorithm_by_asset(algo_df: pd.DataFrame) -> pd.DataFrame:
     keep_cols = [c for c in ["asset_id", "timestamp", "model", "region", "criticality", "environment_type", "days_since_last_pm", "anomaly_score", "algorithm_failure_risk_score", "algorithm_risk_band", "algorithm_predicted_failure_within_30d", "recommended_action"] if c in latest.columns]
     return latest[keep_cols].sort_values("algorithm_failure_risk_score", ascending=False)
 
+
+
+# -----------------------------
+# Machine Learning helpers
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def prepare_ml_frame(raw_df: pd.DataFrame, target_col: str = "failure_within_30d", max_rows: int = 90000):
+    """Prepare telemetry data for supervised failure-risk modeling."""
+    if raw_df.empty or target_col not in raw_df.columns:
+        return pd.DataFrame(), [], []
+
+    use_cols = [
+        "asset_id", "age_years", "days_since_last_pm", "runtime_hours_week", "avg_load_pct", "oil_temp_c",
+        "coolant_temp_c", "battery_voltage", "vibration_mm_s", "fuel_rate_lph", "alarm_count", "anomaly_score",
+        "model", "region", "criticality", "environment_type", target_col, "timestamp"
+    ]
+    use_cols = [c for c in use_cols if c in raw_df.columns]
+    df = raw_df[use_cols].copy().dropna(subset=[target_col])
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.sort_values("timestamp")
+
+    # Keep the app fast in Snowflake by training on a balanced sample.
+    if len(df) > max_rows:
+        pos = df[df[target_col] == 1]
+        neg = df[df[target_col] == 0]
+        n_pos = min(len(pos), max_rows // 3)
+        n_neg = max_rows - n_pos
+        df = pd.concat([
+            pos.sample(n=n_pos, random_state=42) if len(pos) > n_pos else pos,
+            neg.sample(n=n_neg, random_state=42) if len(neg) > n_neg else neg,
+        ], axis=0).sample(frac=1, random_state=42)
+
+    feature_cols = [c for c in df.columns if c not in [target_col, "timestamp"]]
+    numeric_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(df[c])]
+    categorical_cols = [c for c in feature_cols if c not in numeric_cols]
+    return df, numeric_cols, categorical_cols
+
+
+@st.cache_resource(show_spinner=False)
+def train_failure_models(df: pd.DataFrame, numeric_cols, categorical_cols, target_col: str = "failure_within_30d"):
+    """Train baseline and advanced ML classifiers for near-term failure prediction."""
+    X = df[numeric_cols + categorical_cols]
+    y = df[target_col].astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_cols),
+            ("cat", categorical_transformer, categorical_cols),
+        ]
+    )
+
+    models = {
+        "Logistic Regression baseline": LogisticRegression(max_iter=500, class_weight="balanced"),
+        "Random Forest advanced model": RandomForestClassifier(
+            n_estimators=160,
+            max_depth=12,
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+        ),
+    }
+
+    results = {}
+    for name, model in models.items():
+        pipe = Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
+        pipe.fit(X_train, y_train)
+        proba = pipe.predict_proba(X_test)[:, 1]
+        pred = (proba >= 0.5).astype(int)
+        results[name] = {
+            "pipeline": pipe,
+            "accuracy": accuracy_score(y_test, pred),
+            "precision": precision_score(y_test, pred, zero_division=0),
+            "recall": recall_score(y_test, pred, zero_division=0),
+            "f1": f1_score(y_test, pred, zero_division=0),
+            "roc_auc": roc_auc_score(y_test, proba),
+            "confusion_matrix": confusion_matrix(y_test, pred),
+        }
+    return results
+
+
+def get_ml_feature_importance(pipeline, model_name: str, top_n: int = 15) -> pd.DataFrame:
+    preprocessor = pipeline.named_steps["preprocessor"]
+    feature_names = preprocessor.get_feature_names_out()
+    model = pipeline.named_steps["model"]
+    if "Logistic" in model_name:
+        values = np.abs(model.coef_[0])
+    else:
+        values = model.feature_importances_
+    out = pd.DataFrame({"feature": feature_names, "importance": values})
+    out["feature"] = out["feature"].str.replace("num__", "", regex=False).str.replace("cat__", "", regex=False)
+    return out.sort_values("importance", ascending=False).head(top_n)
+
+
+def score_latest_asset_risk(telemetry_df: pd.DataFrame, pipeline) -> pd.DataFrame:
+    latest = telemetry_df.copy()
+    if latest.empty or "asset_id" not in latest.columns:
+        return pd.DataFrame()
+    if "timestamp" in latest.columns:
+        latest["timestamp"] = pd.to_datetime(latest["timestamp"], errors="coerce")
+        latest = latest.sort_values("timestamp").groupby("asset_id", as_index=False).tail(1)
+
+    feature_cols = [
+        "asset_id", "age_years", "days_since_last_pm", "runtime_hours_week", "avg_load_pct", "oil_temp_c",
+        "coolant_temp_c", "battery_voltage", "vibration_mm_s", "fuel_rate_lph", "alarm_count", "anomaly_score",
+        "model", "region", "criticality", "environment_type"
+    ]
+    feature_cols = [c for c in feature_cols if c in latest.columns]
+    latest = latest.copy()
+    latest["ml_predicted_failure_risk"] = pipeline.predict_proba(latest[feature_cols])[:, 1]
+    latest["ml_risk_band"] = pd.cut(
+        latest["ml_predicted_failure_risk"],
+        bins=[-0.01, 0.30, 0.60, 0.80, 1.0],
+        labels=["Low", "Medium", "High", "Critical"],
+    )
+    latest["ml_recommended_action"] = np.select(
+        [
+            latest["ml_predicted_failure_risk"] >= 0.80,
+            latest["ml_predicted_failure_risk"] >= 0.60,
+            latest["ml_predicted_failure_risk"] >= 0.30,
+        ],
+        [
+            "Immediate inspection / PM within 3 days",
+            "Schedule PM within 7 days",
+            "Watch list / inspect soon",
+        ],
+        default="Normal monitoring",
+    )
+    keep = [c for c in [
+        "asset_id", "timestamp", "model", "region", "criticality", "days_since_last_pm",
+        "anomaly_score", "battery_voltage", "vibration_mm_s", "alarm_count",
+        "ml_predicted_failure_risk", "ml_risk_band", "ml_recommended_action"
+    ] if c in latest.columns]
+    return latest[keep].sort_values("ml_predicted_failure_risk", ascending=False)
+
+
+def build_prescriptive_pm_plan(ml_risk_df: pd.DataFrame, linked_df: pd.DataFrame, business_df: pd.DataFrame) -> pd.DataFrame:
+    if ml_risk_df.empty:
+        return pd.DataFrame()
+    plan = ml_risk_df.copy()
+    if not linked_df.empty and {"asset_id", "days_to_next_failure"}.issubset(linked_df.columns):
+        hist = linked_df.copy()
+        hist["days_to_next_failure"] = pd.to_numeric(hist["days_to_next_failure"], errors="coerce")
+        hist = hist.groupby("asset_id", as_index=False)["days_to_next_failure"].median()
+        hist = hist.rename(columns={"days_to_next_failure": "historical_median_days_to_failure"})
+        plan = plan.merge(hist, on="asset_id", how="left")
+
+    avg_failure_cost = 0.0
+    if not business_df.empty:
+        if "repair_cost" in business_df.columns:
+            avg_failure_cost += pd.to_numeric(business_df["repair_cost"], errors="coerce").fillna(0).mean()
+        if "truck_roll_cost" in business_df.columns:
+            avg_failure_cost += pd.to_numeric(business_df["truck_roll_cost"], errors="coerce").fillna(0).mean()
+    plan["estimated_failure_cost_exposure"] = avg_failure_cost
+
+    plan["prescriptive_pm_action"] = np.select(
+        [
+            plan["ml_predicted_failure_risk"] >= 0.80,
+            (plan["ml_predicted_failure_risk"] >= 0.60) | (pd.to_numeric(plan.get("days_since_last_pm", 0), errors="coerce").fillna(0) > 120),
+            plan["ml_predicted_failure_risk"] >= 0.30,
+        ],
+        [
+            "Create urgent work order and inspect immediately",
+            "Plan PM in next 7 days and review alarms / vibration",
+            "Increase monitoring and inspect in next PM window",
+        ],
+        default="Maintain current PM cycle",
+    )
+    plan["priority_rank"] = plan["ml_predicted_failure_risk"].rank(method="dense", ascending=False).astype(int)
+    return plan.sort_values("priority_rank")
 
 def identify_uploaded_zip(uploaded_zip) -> Dict[str, pd.DataFrame]:
     """Accepts a zip containing CSVs with expected names."""
@@ -440,6 +630,7 @@ telemetry_df = filtered.get("telemetry_weekly", pd.DataFrame())
 # -----------------------------
 st.title("⚙️ Generator Preventive Maintenance Reliability Dashboard")
 st.caption("Upload your own maintenance data or use the included demo dataset to analyze PM effectiveness, failure risk, and business impact.")
+st.info("Snowflake upload-ready version: includes PM-to-failure analytics, Predictive ML, and Prescriptive PM Strategy. Use warehouse runtime with packages from environment.yml.")
 
 with st.expander("Expected CSV inputs", expanded=False):
     st.markdown(
@@ -450,9 +641,10 @@ with st.expander("Expected CSV inputs", expanded=False):
         - `failure_events.csv`: unplanned repair/failure tickets
         - `pm_failure_linked.csv`: optional; dashboard can rebuild it
         - `telemetry_weekly.csv`: optional sensor/risk history
+        - `generator_telemetry_with_labels.csv`: optional ML training table with `failure_within_14d` and `failure_within_30d`
         - `business_impact.csv`: optional downtime, repair cost, customer impact
 
-        **Minimum required for Jeff-style analysis**
+        **Minimum required for PM-to-failure analysis**
         - `pm_events.csv` with `pm_event_id`, `asset_id`, `pm_date`
         - `failure_events.csv` with `failure_event_id`, `asset_id`, `failure_date`
         """
@@ -468,6 +660,7 @@ tabs = st.tabs([
     "PM Effectiveness",
     "Failures & Cost",
     "Telemetry Risk",
+    "Predictive ML & PM Strategy",
     "Saved Outputs",
     "Data Explorer & Export",
 ])
@@ -511,10 +704,13 @@ with tabs[0]:
         4. **Analyze failure cost and downtime**  
            It summarizes repair cost, truck-roll cost, downtime, SLA impact, and customer impact.
 
-        5. **Add risk layer**  
-           Telemetry and anomaly signals show which assets are most likely to fail soon.
+        5. **Train ML failure-risk models**  
+           Logistic Regression and Random Forest predict whether a generator may fail within 14 or 30 days.
 
-        6. **Export outputs**  
+        6. **Prescribe PM actions**  
+           ML risk scores are converted into priority bands and recommended maintenance actions.
+
+        7. **Export outputs**  
            KPI tables and processed datasets can be downloaded for Power BI, Excel, Streamlit sharing, or a client deck.
         """
     )
@@ -801,7 +997,6 @@ with tabs[3]:
                         temp.sample(min(len(temp), 5000), random_state=42),
                         x="delay_days",
                         y="days_to_next_failure",
-                        trendline="ols",
                         title="PM delay vs days to next failure",
                         labels={"delay_days": "PM delay days", "days_to_next_failure": "Days to next failure"},
                     )
@@ -926,10 +1121,140 @@ with tabs[5]:
             st.dataframe(high_risk, use_container_width=True)
 
 
+
+# -----------------------------
+# Predictive ML & PM Strategy tab
+# -----------------------------
+with tabs[6]:
+    st.header("Predictive ML and Prescriptive PM Strategy")
+    st.markdown(
+        """
+        This is the **machine-learning section** of the dashboard. It trains real supervised ML models on telemetry records,
+        compares their performance, scores each asset, and converts the score into maintenance actions.
+
+        **Three-phase flow:**
+        1. **Phase 1 - Reliability analytics:** PM completed → next failure → days to next failure.
+        2. **Phase 2 - Predictive ML:** telemetry + PM recency → failure probability within 14 or 30 days.
+        3. **Phase 3 - Prescriptive PM:** failure probability + business impact → recommended maintenance action.
+        """
+    )
+
+    # Prefer full raw telemetry with model/region/criticality if available. Otherwise use telemetry_weekly.
+    ml_source_df = raw_telemetry_df.copy() if not raw_telemetry_df.empty else telemetry_df.copy()
+    if ml_source_df.empty:
+        st.warning("No telemetry dataset found for ML training.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        target_col = c1.selectbox("ML prediction target", ["failure_within_30d", "failure_within_14d"], index=0)
+        max_rows = c2.slider("Training sample size", min_value=20000, max_value=120000, value=90000, step=10000)
+        c3.metric("ML source rows", f"{len(ml_source_df):,}")
+
+        st.subheader("ML inputs")
+        st.markdown(
+            """
+            The model uses telemetry and asset-context features including:
+            `days_since_last_pm`, `runtime_hours_week`, `avg_load_pct`, `oil_temp_c`, `coolant_temp_c`,
+            `battery_voltage`, `vibration_mm_s`, `fuel_rate_lph`, `alarm_count`, `anomaly_score`,
+            `model`, `region`, `criticality`, and `environment_type`.
+            """
+        )
+
+        ml_frame, numeric_cols, categorical_cols = prepare_ml_frame(ml_source_df, target_col=target_col, max_rows=max_rows)
+        if ml_frame.empty:
+            st.error(f"Cannot train ML model because `{target_col}` is not available in the telemetry dataset.")
+        else:
+            with st.spinner("Training Logistic Regression and Random Forest models..."):
+                ml_results = train_failure_models(ml_frame, numeric_cols, categorical_cols, target_col=target_col)
+
+            perf_df = pd.DataFrame([
+                {
+                    "Model": model_name,
+                    "Accuracy": result["accuracy"],
+                    "Precision": result["precision"],
+                    "Recall": result["recall"],
+                    "F1": result["f1"],
+                    "ROC AUC": result["roc_auc"],
+                }
+                for model_name, result in ml_results.items()
+            ]).sort_values("ROC AUC", ascending=False)
+
+            st.subheader("Phase 2 output: trained ML model comparison")
+            st.dataframe(
+                perf_df.style.format({"Accuracy": "{:.3f}", "Precision": "{:.3f}", "Recall": "{:.3f}", "F1": "{:.3f}", "ROC AUC": "{:.3f}"}),
+                use_container_width=True,
+            )
+            best_model_name = perf_df.iloc[0]["Model"]
+            best_model = ml_results[best_model_name]["pipeline"]
+            st.success(f"Best model for the current data/filter selection: **{best_model_name}**")
+
+            left, right = st.columns(2)
+            with left:
+                st.subheader("Confusion matrix")
+                cm = ml_results[best_model_name]["confusion_matrix"]
+                cm_df = pd.DataFrame(cm, index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"])
+                fig = px.imshow(cm_df, text_auto=True, title=f"Confusion matrix - {best_model_name}")
+                st.plotly_chart(fig, use_container_width=True)
+            with right:
+                st.subheader("Top predictive drivers")
+                fi = get_ml_feature_importance(best_model, best_model_name, top_n=15)
+                fig = px.bar(fi.sort_values("importance"), x="importance", y="feature", orientation="h", title="Feature importance")
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Phase 2 output: asset-level ML failure risk")
+            latest_risk = score_latest_asset_risk(ml_source_df, best_model)
+            if latest_risk.empty:
+                st.info("No latest asset risk records available.")
+            else:
+                st.dataframe(
+                    latest_risk.head(30).style.format({"ml_predicted_failure_risk": "{:.2%}"}),
+                    use_container_width=True,
+                )
+
+                if "ml_risk_band" in latest_risk.columns:
+                    band = latest_risk["ml_risk_band"].astype(str).value_counts().reset_index()
+                    band.columns = ["risk_band", "asset_count"]
+                    fig = px.bar(band, x="risk_band", y="asset_count", title="Asset count by ML risk band")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Phase 3 output: prescriptive PM action plan")
+            action_plan = build_prescriptive_pm_plan(latest_risk, linked_df, business_df)
+            if action_plan.empty:
+                st.info("No action plan could be generated.")
+            else:
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Critical assets", f"{int((action_plan['ml_predicted_failure_risk'] >= 0.8).sum()):,}")
+                p2.metric("High-risk assets", f"{int(((action_plan['ml_predicted_failure_risk'] >= 0.6) & (action_plan['ml_predicted_failure_risk'] < 0.8)).sum()):,}")
+                p3.metric("Top-20 cost exposure", money(action_plan.head(20).get("estimated_failure_cost_exposure", pd.Series(dtype=float)).sum()))
+
+                st.dataframe(
+                    action_plan.head(30).style.format({
+                        "ml_predicted_failure_risk": "{:.2%}",
+                        "estimated_failure_cost_exposure": "${:,.0f}",
+                        "historical_median_days_to_failure": "{:.0f}",
+                    }),
+                    use_container_width=True,
+                )
+
+                if "prescriptive_pm_action" in action_plan.columns:
+                    actions = action_plan["prescriptive_pm_action"].value_counts().reset_index()
+                    actions.columns = ["action", "asset_count"]
+                    fig = px.bar(actions, x="asset_count", y="action", orientation="h", title="Recommended PM actions from ML risk")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("What this ML proves")
+            st.markdown(
+                """
+                - The dashboard is no longer only rule-based. It now **trains supervised ML models** on telemetry labels.
+                - Logistic Regression provides an explainable baseline.
+                - Random Forest captures nonlinear failure patterns from vibration, battery voltage, alarms, anomaly score, and PM recency.
+                - The output is not just a chart; it is an asset-level probability of near-term failure and a PM recommendation.
+                """
+            )
+
 # -----------------------------
 # Saved Outputs tab
 # -----------------------------
-with tabs[6]:
+with tabs[7]:
     st.header("Saved Outputs Included in Package")
     st.markdown("These are pre-generated figures and tables from the notebook workflow.")
 
@@ -965,7 +1290,7 @@ with tabs[6]:
 # -----------------------------
 # Data Explorer & Export tab
 # -----------------------------
-with tabs[7]:
+with tabs[8]:
     st.header("Data Explorer and Export")
 
     table_options = {

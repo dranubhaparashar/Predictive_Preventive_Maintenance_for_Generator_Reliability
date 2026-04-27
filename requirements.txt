@@ -1,9 +1,5 @@
 streamlit
 pandas
 numpy
-plotly
-statsmodels
-scikit-learn
 matplotlib
-jupyter
-pyyaml
+scikit-learn

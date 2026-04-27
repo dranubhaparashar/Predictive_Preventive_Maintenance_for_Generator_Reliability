@@ -1,0 +1,12 @@
+-- Run this in Snowsight before deploying if you want a clean database/schema/stage.
+-- Change role/warehouse/database names if your Snowflake admin gave you different names.
+
+USE ROLE SYSADMIN;
+CREATE WAREHOUSE IF NOT EXISTS COMPUTE_WH
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+CREATE DATABASE IF NOT EXISTS GENERATOR_PM_DB;
+CREATE SCHEMA IF NOT EXISTS GENERATOR_PM_DB.PUBLIC;
+CREATE STAGE IF NOT EXISTS GENERATOR_PM_DB.PUBLIC.GENERATOR_PM_STREAMLIT_STAGE;

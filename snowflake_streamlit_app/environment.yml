@@ -1,10 +1,13 @@
 name: generator_pm_streamlit
 channels:
   - snowflake
-  - conda-forge
 dependencies:
-  - python=3.11
   - streamlit
-  - pandas
+  - pandas=2.*
   - numpy
   - plotly
+  - scikit-learn
+  - matplotlib
+  - altair
+  - pyyaml
+  - snowflake-snowpark-python

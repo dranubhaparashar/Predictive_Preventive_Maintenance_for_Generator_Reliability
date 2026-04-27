@@ -1,0 +1,10 @@
+name: generator_pm_streamlit
+channels:
+  - snowflake
+  - conda-forge
+dependencies:
+  - python=3.11
+  - streamlit
+  - pandas
+  - numpy
+  - plotly
