@@ -1,0 +1,12 @@
+metric,value
+asset_count,1800.0
+pm_event_count,17905.0
+failure_event_count,8437.0
+telemetry_row_count,282600.0
+avg_days_to_next_failure,166.75
+median_days_to_next_failure,122.0
+pct_pm_without_observed_failure,20.1
+pct_ontime_pm,60.06
+avg_failure_total_cost,1264.58
+avg_downtime_hours,6.68
+failure_within_30d_rate_telemetry,11.95

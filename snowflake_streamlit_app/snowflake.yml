@@ -1,0 +1,19 @@
+definition_version: 2
+entities:
+  generator_pm_reliability_dashboard:
+    type: streamlit
+    identifier: GENERATOR_PM_RELIABILITY_DASHBOARD
+    title: Generator PM Reliability Dashboard
+    comment: Predictive preventive maintenance dashboard for generator reliability, PM-to-failure analysis, risk scoring, and business impact.
+    stage: GENERATOR_PM_STREAMLIT_STAGE
+    query_warehouse: COMPUTE_WH
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - environment.yml
+      - src: data/**/*
+        dest: data/
+      - src: outputs/**/*
+        dest: outputs/
+      - src: docs/**/*
+        dest: docs/
